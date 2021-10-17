@@ -6,4 +6,4 @@ Check full blog post from:
 
 https://www.sufle.io/blog/custom-amazon-eks-ami-build
 
-[1] https://github.com/sufleio/amazon-eks-ami
+[1] https://github.com/awslabs/amazon-eks-ami

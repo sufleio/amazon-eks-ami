@@ -1,0 +1,275 @@
+---
+
+#====================================================================================================
+# AWS CloudFormation template to setup Amazon EKS AMI using Amazon EC2 Image Builder
+#====================================================================================================
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: This template contains resources and configuration scripts for building a custom Amazon EKS AMI with Amazon EC2 Image Builder
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Kubernetes Configuration"
+        Parameters:
+          - KubernetesVersion
+          - KubernetesBuildDate
+          - DockerVersion
+          - CNIPluginVersion
+          - PullCNIFromGithub
+          - ContainerdVersion
+          - RuncVersion
+      - Label:
+          default: "Image Configuration"
+        Parameters:
+          - Arch
+          - InstanceType
+      - Label:
+          default: "Additional Configuration"
+        Parameters:
+          - ScriptBucket
+          - AdditionalRepos
+          - KernelVersion
+
+Parameters:
+  KubernetesVersion:
+    Type: String
+    Description: Kubernetes Version
+    AllowedValues:
+      - "1.17.17"
+      - "1.18.20"
+      - "1.19.14"
+      - "1.20.10"
+      - "1.21.4"
+  DockerVersion:
+    Type: String
+    Description: Docker Version
+    Default: "20.10.7-3.amzn2"
+  CNIPluginVersion:
+    Type: String
+    Description: CNI Plugin Version
+    Default: "v0.8.6"
+  SonobuoyE2ERegistry:
+    Type: String
+    Description: Sonobuoy E2E Registry
+    Default: ""
+  ContainerdVersion:
+    Type: String
+    Description: Containerd Version
+    Default: "1.4.6-3.amzn2"
+  RuncVersion:
+    Type: String
+    Description: Runc Version
+    Default: "1.0.0-2.amzn2"
+  BinaryBucketName:
+    Type: String
+    Description: Binary Bucket Name of AWS
+    Default: "amazon-eks"
+  BinaryBucketRegion:
+    Type: String
+    Description: Binary Bucket Region of AWS
+    Default: "us-west-2"
+  PullCNIFromGithub:
+    Type: String
+    Description: Pull CNI from Github, otherwise it will pull from binary bucket
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+  Arch:
+    Type: String
+    Description: Architecture of image
+    Default: "x86-64"
+    AllowedValues:
+      - "x86-64"
+      - "arm64"
+  ScriptBucket:
+    Type: String
+    Description: S3 bucket created, that contains scripts and files
+    Default: ""
+  AdditionalRepos:
+    Type: String
+    Description: Additional yum repositories
+    Default: ""
+  KernelVersion:
+    Type: String
+    Description: Kernel version, automatically configured if not selected
+    Default: ""
+    AllowedValues:
+      - ""
+      - "4.14"
+      - "5.4"
+
+Mappings:
+  Instance:
+    x86-64:
+      source: "amazon-linux-2-x86"
+      type: "m4.large"
+    arm64:
+      source: "amazon-linux-2-arm64"
+      type: "m6g.large"
+
+Resources:
+  EKSAMIComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: 'EKS Optimized AMI'
+      Platform: 'Linux'
+      Version: "1.0.0"
+      Description: 'Component to create EKS Optimized AMI'
+      Data: !Sub |
+        name: EKS Optimized AMI Setuo
+        description: This steps creates EKS Optimized AMI
+        schemaVersion: 1.0
+
+        phases:
+          - name: build
+            steps:
+              - name: ScriptsDirectoryCreation
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - mkdir -p /tmp/scripts/
+              - name: DownloadScriptsFromS3
+                action: S3Download
+                inputs:
+                  - source: 's3://${ScriptBucket}/scripts/*'
+                    destination: /tmp/scripts/
+              - name: InstallAdditionalRepos
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - ADDITIONAL_YUM_REPOS=${AdditionalRepos} bash /tmp/scripts/install_additional_repos.sh
+              - name: UpgradeKernel
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - KUBERNETES_VERSION=${KubernetesVersion} KERNEL_VERSION=${KernelVersion} bash /tmp/scripts/upgrade_kernel.sh
+              - name: RebootStep
+                action: Reboot
+                maxAttempts: 2
+                inputs:
+                  delaySeconds: 60
+              - name: WorkerDirectoryCreation
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - mkdir -p /tmp/worker/
+              - name: DownloadFilesFromS3
+                action: S3Download
+                inputs:
+                  - source: 's3://${ScriptBucket}/files/*'
+                    destination: /tmp/worker/
+              - name: InstallWorker
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - KUBERNETES_VERSION=${KubernetesVersion} BINARY_BUCKET_NAME=${BinaryBucketName} BINARY_BUCKET_REGION=${BinaryBucketRegion} DOCKER_VERSION=${DockerVersion} CONTAINERD_VERSION=${ContainerdVersion} RUNC_VERSION=${RuncVersion} CNI_PLUGIN_VERSION=${CNIPluginVersion} PULL_CNI_FROM_GITHUB=${PullCNIFromGithub} SONOBUOY_E2E_REGISTRY=${SonobuoyE2ERegistry} bash /tmp/scripts/install_worker.sh
+              - name: CleanupAdditionalRepos
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - ADDITIONAL_YUM_REPOS=${AdditionalRepos} bash /tmp/scripts/cleanup_additional_repos.sh
+
+  EKSAMIRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: 'EKSAMIRecipe'
+      Version: '1.0.0'
+      # ${AWS::Partition} returns the partition where you are running the CloudFormation template. For standard AWS regions, the
+      # partition is aws. For resources elsewhere, the partition is aws-partitionname. For example, China (Beijing and Ningxia)
+      # regions use aws-cn and AWS GovCloud (US) regions are aws-us-gov.
+      # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/pseudo-parameter-reference.html
+      ParentImage: !Join
+        - ''
+        - - 'arn:'
+          - !Ref AWS::Partition
+          - ':imagebuilder:'
+          - !Ref AWS::Region
+          - ':aws:image/'
+          - !FindInMap [ Instance, !Ref Arch, source ]
+          - '/x.x.x'
+      Description: 'Recipe to create EKS Optimized AMI'
+      Components:
+        # Add new components here if you want to customize the build process
+        - ComponentArn: !Ref EKSAMIComponent
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      Comment: Role to be used by instance during image build.
+    Properties:
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/EC2InstanceProfileForImageBuilder
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+        Version: "2012-10-17"
+      Path: /executionServiceEC2Role/
+
+  InstanceRoleBucketPolicy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      Comment: Allows the instance to access configuration files.
+    Properties:
+      PolicyName: BucketPolicy
+      Roles:
+        - Ref: InstanceRole
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Effect: Allow
+            Resource:
+              - Fn::Sub:
+                  - arn:${AWS::Partition}:s3:::${BUCKET}/*
+                  - BUCKET:
+                      Ref: ScriptBucket
+              - Fn::Sub:
+                  - arn:${AWS::Partition}:s3:::${BUCKET}
+                  - BUCKET:
+                      Ref: ScriptBucket
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /executionServiceEC2Role/
+      Roles:
+        - Ref: InstanceRole
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+        GroupDescription: Security group for imagebuilder
+
+  EKSAMIInfrastructureConfiguration:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: 'EKSAMIInfrastructureConfiguration'
+      InstanceProfileName: !Ref InstanceProfile
+      Description: 'Infrastructure configuration to create EKS Optimized AMI'
+      InstanceTypes:
+        - !FindInMap [ Instance, !Ref Arch, type ]
+      TerminateInstanceOnFailure: false
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+
+  EKSAMIPipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: 'EKSAMIPipeline'
+      Description: 'Pipeline to create EKS Optimized AMI'
+      ImageRecipeArn: !Ref EKSAMIRecipe
+      InfrastructureConfigurationArn: !Ref EKSAMIInfrastructureConfiguration
+      ImageTestsConfiguration:
+        ImageTestsEnabled: false
+        TimeoutMinutes: 90
+      Status: 'ENABLED'
